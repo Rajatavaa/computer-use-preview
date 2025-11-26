@@ -11,7 +11,6 @@ import os
 import json
 from datetime import datetime
 
-# Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -40,7 +39,6 @@ SERVICES = {
     }}
 
 def wait_for_response(browser_computer, max_wait=60) -> bool:
-    """Wait for ChatGPT response to complete"""
     import time
 
     page = browser_computer._page
@@ -84,7 +82,6 @@ def wait_for_response(browser_computer, max_wait=60) -> bool:
 
 
 def extract_chatgpt_data(browser_computer, debug=True) -> dict:
-    """Extract search queries and response from ChatGPT DOM (no login required)"""
     try:
         import time
 
@@ -238,7 +235,6 @@ def extract_chatgpt_data(browser_computer, debug=True) -> dict:
 
 
 def extract_perplexity_data(browser_computer) -> dict:
-    """Extract structured data from Perplexity"""
     try:
         import time
 
