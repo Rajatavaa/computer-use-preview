@@ -300,11 +300,33 @@ class PlaywrightComputer(Computer):
         return self.current_state()
 
     def current_state(self) -> EnvState:
-        self._page.wait_for_load_state()
+        try:
+            self._page.wait_for_load_state(timeout=30000)
+        except Exception:
+            pass  # Continue even if load state times out
+
         # Even if Playwright reports the page as loaded, it may not be so.
         # Add a manual sleep to make sure the page has finished rendering.
         time.sleep(0.5)
-        screenshot_bytes = self._page.screenshot(type="png", full_page=False)
+
+        try:
+            screenshot_bytes = self._page.screenshot(type="png", full_page=False, timeout=30000)
+        except Exception as e:
+            print(f"Screenshot timeout, retrying with animations disabled: {e}")
+            try:
+                # Disable animations and retry
+                self._page.evaluate("document.body.style.animation = 'none'")
+                screenshot_bytes = self._page.screenshot(type="png", full_page=False, timeout=15000)
+            except Exception:
+                # If still failing, create a blank screenshot
+                print("Screenshot still failing, creating placeholder")
+                from PIL import Image
+                import io
+                img = Image.new('RGB', (self._screen_size[0], self._screen_size[1]), color='white')
+                buffer = io.BytesIO()
+                img.save(buffer, format='PNG')
+                screenshot_bytes = buffer.getvalue()
+
         return EnvState(screenshot=screenshot_bytes, url=self._page.url)
 
     def screen_size(self) -> tuple[int, int]:
