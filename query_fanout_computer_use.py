@@ -1,7 +1,7 @@
 """
-Query Fanout with Computer Use API
-Integrates query fanout functionality with Gemini Computer Use API
-to query multiple AI services and collect results.
+Query Fanout with Playwright
+Uses pure Playwright for browser automation to query multiple AI services.
+No external AI (Gemini) needed - just direct DOM manipulation.
 """
 
 import sys
@@ -9,6 +9,7 @@ import asyncio
 import argparse
 import os
 import json
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -22,12 +23,10 @@ if sys.platform == 'win32':
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from agent import BrowserAgent
-from computers import BrowserbaseComputer
+from computers import BrowserbaseComputer, PlaywrightComputer
 
 SCREEN_SIZE = (1440, 900)
 
-# Define the services to query
 SERVICES = {
     "chatgpt": {
         "url": "https://chatgpt.com/",
@@ -38,9 +37,347 @@ SERVICES = {
         "name": "Perplexity"
     }}
 
-def wait_for_response(browser_computer, max_wait=60) -> bool:
-    import time
+def submit_chatgpt_query(page, query: str) -> bool:
+    """Submit a query to ChatGPT using Playwright with web search enabled."""
+    try:
+        print("Submitting query to ChatGPT...")
 
+        time.sleep(3)
+
+        textarea_selectors = [
+            'textarea[placeholder*="Ask"]',
+            'textarea[data-id="root"]',
+            '#prompt-textarea',
+            'textarea',
+        ]
+
+        textarea = None
+        for selector in textarea_selectors:
+            try:
+                textarea = page.wait_for_selector(selector, timeout=5000)
+                if textarea:
+                    print(f"Found textarea with selector: {selector}")
+                    break
+            except:
+                continue
+
+        if not textarea:
+            print("Could not find textarea, trying to click in the center area")
+            page.click('body')
+            time.sleep(1)
+            textarea = page.query_selector('textarea')
+
+        if not textarea:
+            raise Exception("Could not find ChatGPT input textarea")
+
+        textarea.click()
+        time.sleep(0.5)
+
+        # Look for web search toggle button and enable it
+        web_search_selectors = [
+            'button[aria-label*="Search"]',
+            'button[aria-label*="search"]',
+            'button[data-testid*="search"]',
+            '[aria-label*="web"]',
+            'button:has(svg):near(textarea)',  # Button with icon near textarea
+        ]
+
+        for selector in web_search_selectors:
+            try:
+                search_btn = page.query_selector(selector)
+                if search_btn:
+                    print(f"Found web search button: {selector}")
+                    search_btn.click()
+                    time.sleep(1)
+                    break
+            except:
+                continue
+
+        textarea.fill(query)
+        time.sleep(0.5)
+
+        textarea.press('Enter')
+        print("Query submitted!")
+
+        return True
+
+    except Exception as e:
+        print(f"Error submitting ChatGPT query: {e}")
+        return False
+
+
+def wait_for_cloudflare(page, max_wait=30) -> bool:
+    """Wait for Cloudflare challenge to complete."""
+    print("Checking for Cloudflare protection...")
+
+    for i in range(max_wait):
+        title = page.title().lower()
+
+        if "just a moment" in title or "checking" in title or "cloudflare" in title:
+            if i % 5 == 0:
+                print(f"  Waiting for Cloudflare... ({i}s)")
+            time.sleep(1)
+        else:
+            print(f"  Cloudflare passed! Page title: {page.title()}")
+            return True
+
+    print("  Cloudflare timeout - proceeding anyway")
+    return False
+
+
+def submit_perplexity_query(page, query: str, captured_responses: list) -> bool:
+    """
+    Submit a query to Perplexity using Playwright.
+    Uses selectors from perplex_query.py seleniumbase implementation.
+
+    Args:
+        page: Playwright page object
+        query: The query to submit
+        captured_responses: List to store captured SSE responses (passed by reference)
+    """
+    try:
+        print("Submitting query to Perplexity...")
+
+        wait_for_cloudflare(page, max_wait=30)
+
+        time.sleep(3)
+
+        print(f"Page title: {page.title()}")
+
+        input_selector = '#ask-input'
+
+        input_elem = page.query_selector(input_selector)
+
+        if not input_elem:
+            print(f"Primary selector '{input_selector}' not found, trying alternatives...")
+            # Fallback selectors
+            fallback_selectors = [
+                'textarea[placeholder*="Ask"]',
+                'textarea',
+                '[contenteditable="true"]',
+            ]
+            for selector in fallback_selectors:
+                input_elem = page.query_selector(selector)
+                if input_elem:
+                    print(f"Found input with fallback selector: {selector}")
+                    break
+
+        if not input_elem:
+            raise Exception("Could not find Perplexity input")
+
+        input_elem.click()
+        time.sleep(0.5)
+
+        input_elem.fill(query)
+        print(f"Typed query: {query}")
+        time.sleep(2)
+
+        try:
+            close_btn = page.query_selector('button[data-testid="floating-signup-close-button"]')
+            if close_btn:
+                print("Closing signup popup...")
+                close_btn.click()
+                time.sleep(1)
+        except:
+            pass  # Popup might not appear
+
+        submit_btn = page.query_selector('button[aria-label="Submit"]')
+        if submit_btn:
+            print("Clicking submit button...")
+            submit_btn.click()
+        else:
+            # Fallback: press Enter
+            print("Submit button not found, pressing Enter...")
+            input_elem.press('Enter')
+
+        print("Query submitted!")
+        return True
+
+    except Exception as e:
+        print(f"Error submitting Perplexity query: {e}")
+        return False
+
+
+def setup_perplexity_cdp_capture(page) -> dict:
+    """
+    Set up CDP network capture to intercept Perplexity SSE responses.
+    Uses Chrome DevTools Protocol similar to perplex_query.py
+    Returns a dict that will be populated with the request_id and responses.
+    """
+    capture_data = {
+        'request_id': None,
+        'responses': []
+    }
+
+    # Get the CDP session from Playwright
+    cdp = page.context.new_cdp_session(page)
+
+    # Enable network with large buffer for SSE streams (like perplex_query.py)
+    cdp.send("Network.enable", {
+        "maxTotalBufferSize": 100000000,  # 100MB
+        "maxResourceBufferSize": 50000000,  # 50MB
+        "maxPostDataSize": 10000000,  # 10MB
+    })
+
+    def on_response_received(params):
+        url = params.get('response', {}).get('url', '')
+        if '/rest/sse/perplexity_ask' in url:
+            request_id = params.get('requestId')
+            capture_data['request_id'] = request_id
+            print(f"🎯 CDP captured perplexity_ask request: {request_id}")
+
+    # Listen for responses
+    cdp.on("Network.responseReceived", on_response_received)
+
+    capture_data['cdp'] = cdp
+    return capture_data
+
+
+def get_perplexity_sse_body(capture_data: dict) -> str:
+    """
+    Get the SSE response body using CDP after the response is complete.
+    """
+    try:
+        cdp = capture_data.get('cdp')
+        request_id = capture_data.get('request_id')
+
+        if not cdp or not request_id:
+            print("No CDP session or request_id available")
+            return ""
+
+        print(f"Fetching response body for request: {request_id}")
+        result = cdp.send("Network.getResponseBody", {"requestId": request_id})
+        body = result.get('body', '')
+        print(f"✓ Got SSE response body: {len(body)} bytes")
+        return body
+    except Exception as e:
+        print(f"Error getting SSE body: {e}")
+        return ""
+
+
+def wait_for_perplexity_response(page, max_wait=90) -> bool:
+    """Wait for Perplexity to finish generating response."""
+    print("Waiting for Perplexity response to complete...")
+
+    last_content_length = 0
+    stable_count = 0
+
+    for i in range(max_wait):
+        try:
+            # Check page state
+            state = page.evaluate("""
+                () => {
+                    // Check for the stop/generating button (means still generating)
+                    const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"]');
+                    const isGenerating = stopBtn && stopBtn.offsetParent !== null;
+
+                    // Check for loading/spinner indicators
+                    const hasSpinner = document.querySelector('[class*="animate-spin"], [class*="loading"], svg[class*="animate"]') !== null;
+
+                    // Look for the answer content in various places
+                    let contentLength = 0;
+                    const contentSelectors = [
+                        '[class*="prose"]',
+                        '[class*="markdown"]',
+                        '[data-testid*="answer"]',
+                        'article',
+                        'main'
+                    ];
+
+                    for (const sel of contentSelectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const len = el.innerText.length;
+                            if (len > contentLength) contentLength = len;
+                        }
+                    }
+
+                    // Check for "related" section which appears after answer is done
+                    const hasRelated = document.querySelector('[class*="related"], [class*="Related"]') !== null;
+
+                    // Check for sources/citations
+                    const sourceCount = document.querySelectorAll('[class*="citation"], [class*="source"] a, a[href^="http"]').length;
+
+                    return {
+                        isGenerating: isGenerating || hasSpinner,
+                        contentLength: contentLength,
+                        hasRelated: hasRelated,
+                        sourceCount: sourceCount
+                    };
+                }
+            """)
+
+            content_length = state.get('contentLength', 0)
+            is_generating = state.get('isGenerating', False)
+            has_related = state.get('hasRelated', False)
+
+            # Content is stable if it hasn't changed for a few iterations
+            if content_length == last_content_length and content_length > 200:
+                stable_count += 1
+            else:
+                stable_count = 0
+            last_content_length = content_length
+
+            # Done if: not generating, has substantial content, and content is stable
+            if not is_generating and content_length > 500 and stable_count >= 3:
+                print(f"✓ Response complete ({content_length} chars, {state.get('sourceCount', 0)} sources)")
+                time.sleep(3)  # Extra wait for related queries to render
+                return True
+
+            # Also done if we see the related section
+            if has_related and content_length > 300:
+                print(f"✓ Response complete with related section ({content_length} chars)")
+                time.sleep(2)
+                return True
+
+            if i % 5 == 0:
+                status = "generating..." if is_generating else f"loading... (stable: {stable_count})"
+                print(f"  {status} - {content_length} chars ({i}s)")
+
+            time.sleep(1)
+        except Exception as e:
+            if "closed" in str(e).lower():
+                print(f"  Browser closed: {e}")
+                return False
+            if i % 10 == 0:
+                print(f"  Error checking state: {e}")
+            time.sleep(1)
+
+    print(f"⚠️  Response timeout after {max_wait}s - proceeding anyway")
+    return True
+
+
+def extract_related_queries_from_sse(captured_responses: list) -> list:
+    """
+    Extract related_queries from captured SSE responses.
+    Based on perplex_query.py regex extraction.
+    """
+    import re
+
+    related_queries = []
+
+    for response in captured_responses:
+        body = response.get('body', '')
+        # Use the same regex pattern from perplex_query.py
+        matches = re.findall(r'related_queries": \[(.*?)\]', body)
+        if matches:
+            queries = re.findall(r'"([^"]*)"', matches[0])
+            queries = [q for q in queries if q and q.strip() not in [',', ' ']]
+            related_queries.extend(queries)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_queries = []
+    for q in related_queries:
+        if q not in seen:
+            seen.add(q)
+            unique_queries.append(q)
+
+    return unique_queries
+
+
+def wait_for_response(browser_computer, max_wait=60) -> bool:
+    """Wait for ChatGPT response to complete"""
     page = browser_computer._page
     print("Waiting for ChatGPT response...")
 
@@ -235,39 +572,100 @@ def extract_chatgpt_data(browser_computer, debug=True) -> dict:
 
 
 def extract_perplexity_data(browser_computer) -> dict:
+    """Extract structured data from Perplexity including related queries"""
     try:
-        import time
-
         page = browser_computer._page
-        time.sleep(3)
+        time.sleep(2)
 
-        # Extract the main answer and sources
+        # Extract the main answer, sources, and related queries
         result = page.evaluate("""
             () => {
-                const answer = document.querySelector('[class*="Answer"]')?.innerText ||
-                              document.querySelector('article')?.innerText || "";
+                // Extract main answer content
+                const answerSelectors = [
+                    '[class*="prose"]',
+                    '[class*="Answer"]',
+                    '[class*="response"]',
+                    'article',
+                    'main [class*="markdown"]'
+                ];
 
+                let answer = "";
+                for (const sel of answerSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText.length > 50) {
+                        answer = el.innerText;
+                        break;
+                    }
+                }
+
+                // Extract sources/citations
                 const sources = Array.from(document.querySelectorAll('a[href^="http"]'))
-                    .filter(a => a.href && a.textContent.trim())
-                    .slice(0, 10)
-                    .map(a => ({ url: a.href, title: a.textContent.trim() }));
+                    .filter(a => {
+                        const href = a.href;
+                        return href &&
+                               !href.includes('perplexity.ai') &&
+                               !href.includes('google.com') &&
+                               a.textContent.trim().length > 0;
+                    })
+                    .slice(0, 15)
+                    .map(a => ({ url: a.href, title: a.textContent.trim().substring(0, 100) }));
 
-                const relatedQueries = Array.from(document.querySelectorAll('[class*="related"]'))
-                    .map(el => el.textContent.trim())
-                    .filter(t => t && t.length > 5);
+                // Extract related queries - Perplexity shows these at the bottom
+                const relatedQueries = [];
 
-                return { answer, sources, relatedQueries };
+                // Try multiple selectors for related queries
+                const relatedSelectors = [
+                    '[class*="related"] button',
+                    '[class*="Related"] button',
+                    '[class*="suggestion"]',
+                    '[class*="Suggestion"]',
+                    'button[class*="query"]',
+                    // Related questions are often in a section at the bottom
+                    '[class*="follow-up"]',
+                    '[class*="FollowUp"]'
+                ];
+
+                for (const sel of relatedSelectors) {
+                    const elements = document.querySelectorAll(sel);
+                    elements.forEach(el => {
+                        const text = el.innerText?.trim();
+                        if (text && text.length > 10 && text.length < 200) {
+                            relatedQueries.push(text);
+                        }
+                    });
+                }
+
+                // Also look for any buttons/links that look like questions
+                document.querySelectorAll('button, [role="button"]').forEach(btn => {
+                    const text = btn.innerText?.trim();
+                    if (text && text.includes('?') && text.length > 15 && text.length < 150) {
+                        if (!relatedQueries.includes(text)) {
+                            relatedQueries.push(text);
+                        }
+                    }
+                });
+
+                // Remove duplicates
+                const uniqueRelated = [...new Set(relatedQueries)];
+
+                return {
+                    answer: answer.substring(0, 3000),
+                    sources,
+                    relatedQueries: uniqueRelated.slice(0, 10)
+                };
             }
         """)
 
+        print(f"Extracted from DOM: {len(result.get('answer', ''))} chars answer, {len(result.get('sources', []))} sources, {len(result.get('relatedQueries', []))} related queries")
         return result
     except Exception as e:
+        print(f"Error extracting Perplexity data: {e}")
         return {"answer": "", "sources": [], "relatedQueries": [], "error": str(e)}
 
 
 def query_service(service_name: str, query: str) -> dict:
     """
-    Query a single service using the computer use API with Browserbase (no login required).
+    Query a single service using Playwright with Browserbase (no login required).
 
     Args:
         service_name: Name of the service to query
@@ -286,43 +684,8 @@ def query_service(service_name: str, query: str) -> dict:
 
     service_info = SERVICES[service_name]
 
-    # Construct the full prompt for the agent
-    if service_name == "chatgpt":
-        full_query = f"""
-        You are on the ChatGPT homepage. Your task is to submit a query WITH WEB SEARCH enabled.
-
-        Steps:
-        1. Find the text input box (large textarea at the middle of the page with "Ask anything" written inside)
-        2. Click on the textarea to focus it
-        3. IMPORTANT: Before typing, look for and click the Web search option with a world web symbol beside Attach,Click it (it enables web search). This is CRITICAL!
-        5. Then type this exact query: {query}
-        6. Press Enter to send the query
-        7. Wait 5-10 seconds for the response to start appearing, then YOUR JOB IS DONE
-
-        IMPORTANT:
-        - You MUST click the Search button to enable web search, otherwise ChatGPT will only use its training data
-        - Do NOT wait for the entire response to complete. Just submit the query and wait a few seconds for it to start responding
-
-        Use these functions: click_at, type_text_at (with press_enter=True), wait_5_seconds
-        """
-    elif service_name == "perplexity":
-        full_query = f"""
-        You are on the Perplexity homepage. Submit this query and wait for the answer.
-
-        Steps:
-        1. Find the search input box
-        2. Click on it to focus
-        3. Type this exact query: {query}
-        4. Press Enter to submit
-        5. Wait for the complete answer with sources
-
-        Use these functions: click_at, type_text_at (with press_enter=True), wait_5_seconds
-        """
-    else:
-        full_query = f"Go to {service_info['name']} and search for: {query}. Extract and provide the results."
-
     print(f"\n{'='*60}")
-    print(f"Querying {service_info['name']}...")
+    print(f"Querying {service_info['name']} (using Playwright)...")
     print(f"Query: {query}")
     print(f"{'='*60}\n")
 
@@ -334,26 +697,24 @@ def query_service(service_name: str, query: str) -> dict:
         )
 
         with env as browser_computer:
-            import time
+            page = browser_computer._page
             print("Waiting for page to load...")
             time.sleep(5)  # Give page time to load initially
 
-            # Create agent to submit the query
-            agent = BrowserAgent(
-                browser_computer=browser_computer,
-                query=full_query,
-                model_name='gemini-2.5-computer-use-preview-10-2025',
-                verbose=True
-            )
+            # Set up CDP capture for Perplexity (before submitting query)
+            cdp_capture = None
+            if service_name == "perplexity":
+                cdp_capture = setup_perplexity_cdp_capture(page)
 
-            # Run the agent to submit query
-            try:
-                agent.agent_loop()
-            except Exception as e:
-                if "Target page, context or browser has been closed" in str(e):
-                    print("⚠️  Browser session closed unexpectedly - possible timeout")
-                    raise Exception("Browser session timed out. Try reducing the complexity of your query or increasing the session timeout.") from e
-                raise
+            # Submit query using Playwright
+            submit_success = False
+            if service_name == "chatgpt":
+                submit_success = submit_chatgpt_query(page, query)
+            elif service_name == "perplexity":
+                submit_success = submit_perplexity_query(page, query, [])
+
+            if not submit_success:
+                raise Exception(f"Failed to submit query to {service_name}")
 
             # Wait for response to complete
             if service_name == "chatgpt":
@@ -364,19 +725,41 @@ def query_service(service_name: str, query: str) -> dict:
                         print("⚠️  Browser closed while waiting for response")
                         raise Exception("Browser session expired while waiting for ChatGPT response.") from e
                     raise
+            elif service_name == "perplexity":
+                # Wait for Perplexity response with proper detection
+                wait_for_perplexity_response(page, max_wait=60)
 
             # Extract structured data based on service
             extracted_data = {}
             if service_name == "chatgpt":
                 extracted_data = extract_chatgpt_data(browser_computer)
             elif service_name == "perplexity":
+                # Try to get related queries from CDP-captured SSE response
+                related_queries_from_sse = []
+                if cdp_capture and cdp_capture.get('request_id'):
+                    sse_body = get_perplexity_sse_body(cdp_capture)
+                    if sse_body:
+                        # Parse related_queries from SSE body
+                        import re
+                        matches = re.findall(r'related_queries": \[(.*?)\]', sse_body)
+                        if matches:
+                            queries = re.findall(r'"([^"]*)"', matches[0])
+                            related_queries_from_sse = [q for q in queries if q and q.strip() not in [',', ' ']]
+                            print(f"Extracted {len(related_queries_from_sse)} related queries from SSE")
+
+                # Also extract from DOM as fallback/additional data
                 extracted_data = extract_perplexity_data(browser_computer)
+
+                # Use SSE-captured queries if available, otherwise use DOM
+                if related_queries_from_sse:
+                    extracted_data['relatedQueries'] = related_queries_from_sse
+                    print(f"Related queries from SSE: {related_queries_from_sse}")
 
             result = {
                 "service": service_name,
                 "service_name": service_info['name'],
                 "query": query,
-                "agent_reasoning": agent.final_reasoning,
+                "method": "playwright",  # Indicate we used Playwright
                 "extracted_data": extracted_data,
                 "timestamp": datetime.now().isoformat(),
                 "success": True
@@ -397,7 +780,7 @@ def query_service(service_name: str, query: str) -> dict:
     return result
 
 
-def fanout_query(query: str, services: list = None, output_file: str = None) -> list:
+def fanout_query(query: str, services: list = None, output_file: str = None) -> list: #type:ignore
     """
     Execute a query across multiple services (fanout pattern).
 
@@ -429,8 +812,7 @@ def fanout_query(query: str, services: list = None, output_file: str = None) -> 
         print(f"\n{'='*60}")
         print(f"Result from {result.get('service_name', service)}:")
         if result.get('success'):
-            print(f"✓ Success")
-            print(f"\nAgent Reasoning: {result.get('agent_reasoning', 'No reasoning')}\n")
+            print(f"✓ Success (method: {result.get('method', 'unknown')})")
 
             # Print extracted data based on service
             extracted = result.get('extracted_data', {})
